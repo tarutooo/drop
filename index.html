@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Simple RTC Chat</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; margin: 16px; }
+    #container { display: flex; gap: 12px; }
+    #left { flex: 1; }
+    #videos { display:flex; gap:8px; flex-wrap:wrap; }
+    video { width: 240px; height: 180px; background: #000; }
+    #chat { border: 1px solid #ddd; padding:8px; height: 320px; overflow:auto; }
+    #controls { margin-bottom: 8px; }
+  </style>
+</head>
+<body>
+  <h2>Simple RTC Chat</h2>
+
+  <div id="controls">
+    Room: <input id="room" value="room1" />
+    Name: <input id="name" value="User" />
+    <button id="join">Join</button>
+    <button id="leave" disabled>Leave</button>
+    <button id="toggleMute" disabled>Toggle Mute</button>
+  </div>
+
+  <div id="container">
+    <div id="left">
+      <div id="videos">
+        <video id="localVideo" autoplay muted playsinline></video>
+      </div>
+    </div>
+    <div id="right">
+      <div id="chat"></div>
+      <form id="chatForm">
+        <input id="msg" autocomplete="off" /><button>Send</button>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`;
+    let ws;
+    let localStream;
+    const pcs = new Map(); // peerId -> RTCPeerConnection
+
+    const localVideo = document.getElementById('localVideo');
+    const videos = document.getElementById('videos');
+    const chat = document.getElementById('chat');
+    const roomInput = document.getElementById('room');
+    const nameInput = document.getElementById('name');
+    const joinBtn = document.getElementById('join');
+    const leaveBtn = document.getElementById('leave');
+    const toggleMuteBtn = document.getElementById('toggleMute');
+
+    const chatForm = document.getElementById('chatForm');
+    const msgInput = document.getElementById('msg');
+
+    let clientId = null;
+
+    async function ensureMedia() {
+      if (!localStream) {
+        localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+        localVideo.srcObject = localStream;
+      }
+    }
+
+    function appendChat(text) {
+      const d = document.createElement('div');
+      d.textContent = text;
+      chat.appendChild(d);
+      chat.scrollTop = chat.scrollHeight;
+    }
+
+    function connectWs() {
+      ws = new WebSocket(wsUrl);
+      ws.addEventListener('open', () => appendChat('WebSocket open'));
+      ws.addEventListener('message', async (ev) => {
+        const data = JSON.parse(ev.data);
+        switch (data.type) {
+          case 'connected':
+            clientId = data.id;
+            break;
+          case 'init':
+            // have id and peers
+            clientId = data.id;
+            appendChat(`Joined as ${clientId}`);
+            for (const p of data.peers) {
+              await createPeerConnection(p.id, true);
+            }
+            break;
+          case 'new-peer':
+            appendChat(`New peer ${data.id} (${data.name})`);
+            await createPeerConnection(data.id, false);
+            break;
+          case 'offer':
+            await onOffer(data);
+            break;
+          case 'answer':
+            await onAnswer(data);
+            break;
+          case 'ice':
+            await onIce(data);
+            break;
+          case 'chat':
+            appendChat(`${data.name || data.from}: ${data.text}`);
+            break;
+          case 'peer-left':
+            appendChat(`Peer left: ${data.id}`);
+            closePeer(data.id);
+            break;
+        }
+      });
+      ws.addEventListener('close', () => appendChat('WebSocket closed'));
+    }
+
+    async function join() {
+      await ensureMedia();
+      connectWs();
+      ws.addEventListener('open', () => {
+        ws.send(JSON.stringify({ type: 'join', room: roomInput.value, name: nameInput.value }));
+      }, { once: true });
+      joinBtn.disabled = true;
+      leaveBtn.disabled = false;
+      toggleMuteBtn.disabled = false;
+    }
+
+    function leave() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.close();
+      }
+      for (const id of Array.from(pcs.keys())) closePeer(id);
+      if (localStream) {
+        for (const t of localStream.getTracks()) t.stop();
+        localStream = null;
+        localVideo.srcObject = null;
+      }
+      joinBtn.disabled = false;
+      leaveBtn.disabled = true;
+      toggleMuteBtn.disabled = true;
+    }
+
+    function send(data) {
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
+    }
+
+    async function createPeerConnection(peerId, isOfferer) {
+      if (pcs.has(peerId)) return;
+      const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+      pcs.set(peerId, pc);
+
+      // attach local tracks
+      if (localStream) {
+        for (const t of localStream.getTracks()) pc.addTrack(t, localStream);
+      }
+
+      const remoteVideo = document.createElement('video');
+      remoteVideo.autoplay = true;
+      remoteVideo.playsInline = true;
+      remoteVideo.id = 'remote-' + peerId;
+      videos.appendChild(remoteVideo);
+
+      pc.addEventListener('track', (ev) => {
+        remoteVideo.srcObject = ev.streams[0];
+      });
+
+      pc.addEventListener('icecandidate', (e) => {
+        if (e.candidate) {
+          send({ type: 'ice', to: peerId, candidate: e.candidate });
+        }
+      });
+
+      if (isOfferer) {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        send({ type: 'offer', to: peerId, sdp: pc.localDescription });
+      }
+    }
+
+    async function onOffer(data) {
+      const from = data.from;
+      await createPeerConnection(from, false);
+      const pc = pcs.get(from);
+      await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      send({ type: 'answer', to: from, sdp: pc.localDescription });
+    }
+
+    async function onAnswer(data) {
+      const from = data.from;
+      const pc = pcs.get(from);
+      if (!pc) return;
+      await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+    }
+
+    async function onIce(data) {
+      const from = data.from;
+      const pc = pcs.get(from);
+      if (!pc) return;
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+      } catch (e) {
+        console.warn('ICE add fail', e);
+      }
+    }
+
+    function closePeer(id) {
+      const pc = pcs.get(id);
+      if (pc) {
+        try { pc.close(); } catch (e) {}
+        pcs.delete(id);
+      }
+      const v = document.getElementById('remote-' + id);
+      if (v && v.parentNode) v.parentNode.removeChild(v);
+    }
+
+    chatForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const text = msgInput.value.trim();
+      if (!text) return;
+      appendChat(`Me: ${text}`);
+      send({ type: 'chat', text });
+      msgInput.value = '';
+    });
+
+    joinBtn.addEventListener('click', join);
+    leaveBtn.addEventListener('click', leave);
+    toggleMuteBtn.addEventListener('click', () => {
+      if (!localStream) return;
+      const audio = localStream.getAudioTracks()[0];
+      if (!audio) return;
+      audio.enabled = !audio.enabled;
+      toggleMuteBtn.textContent = audio.enabled ? 'Mute' : 'Unmute';
+    });
+  </script>
+</body>
+</html>
